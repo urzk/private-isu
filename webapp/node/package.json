@@ -19,6 +19,7 @@
     "@types/ejs": "^3.1.5",
     "@types/memcached": "^2.2.10",
     "@types/node": "^24.13.3",
+    "prettier": "^3.9.9",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
