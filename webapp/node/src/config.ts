@@ -1,4 +1,4 @@
-export const PORT = 8080
+export const PORT = Number(process.env.PORT) || 8080
 
 export const POSTS_PER_PAGE = 20
 export const UPLOAD_LIMIT = 10 * 1024 * 1024

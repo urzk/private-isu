@@ -22,7 +22,28 @@ function decodeSession(data: unknown): SessionData | undefined {
   return JSON.parse(raw) as SessionData
 }
 
-function getSessionFromStore(sid: string): Promise<SessionData | undefined> {
+// アプリは単一プロセスなので、memcached の手前にプロセス内キャッシュを置いて往復を省く
+const LOCAL_SESSION_LIMIT = 100_000
+const localSessions = new Map<string, SessionData>()
+
+function setLocalSession(sid: string, session: SessionData): void {
+  localSessions.delete(sid)
+  localSessions.set(sid, session)
+  if (localSessions.size > LOCAL_SESSION_LIMIT) {
+    const oldest = localSessions.keys().next().value
+    if (oldest !== undefined) localSessions.delete(oldest)
+  }
+}
+
+async function getSessionFromStore(sid: string): Promise<SessionData | undefined> {
+  const local = localSessions.get(sid)
+  if (local) return local
+  const session = await getSessionFromMemcached(sid)
+  if (session) setLocalSession(sid, session)
+  return session
+}
+
+function getSessionFromMemcached(sid: string): Promise<SessionData | undefined> {
   return new Promise((resolve) => {
     memcached.get(SESSION_KEY_PREFIX + sid, (err, data) => {
       if (err) {
@@ -45,6 +66,7 @@ function getSessionFromStore(sid: string): Promise<SessionData | undefined> {
 }
 
 function saveSessionToStore(sid: string, session: SessionData): Promise<void> {
+  setLocalSession(sid, session)
   return new Promise<void>((resolve) => {
     memcached.set(SESSION_KEY_PREFIX + sid, JSON.stringify(session), SESSION_TTL, (err) => {
       if (err) {
@@ -56,6 +78,7 @@ function saveSessionToStore(sid: string, session: SessionData): Promise<void> {
 }
 
 function deleteSessionFromStore(sid: string): Promise<void> {
+  localSessions.delete(sid)
   return new Promise<void>((resolve) => {
     memcached.del(SESSION_KEY_PREFIX + sid, (err) => {
       if (err) {
@@ -87,17 +110,17 @@ export async function sessionMiddleware(c: AppContext, next: Next): Promise<void
   const existingSid = getCookie(c, SESSION_COOKIE_NAME)
   const storedSession = existingSid ? await getSessionFromStore(existingSid) : undefined
 
+  // 新規セッションは中身が書き込まれたときだけ Cookie 発行・保存する(空セッションの保存を省く)
   let sessionId: string
   let session: SessionData
   let isSessionDirty = false
+  const isNewSession = !storedSession
   if (storedSession) {
     sessionId = existingSid as string
     session = storedSession
   } else {
     sessionId = generateToken()
     session = {}
-    isSessionDirty = true
-    setCookie(c, SESSION_COOKIE_NAME, sessionId, { httpOnly: true, path: '/' })
   }
 
   const trackedSession = trackChanges(session, () => {
@@ -108,7 +131,8 @@ export async function sessionMiddleware(c: AppContext, next: Next): Promise<void
   try {
     await next()
   } finally {
-    if (c.get('session') === trackedSession && isSessionDirty) {
+    if (c.get('session') === trackedSession && isSessionDirty && !c.get('sessionDestroyed')) {
+      if (isNewSession) setCookie(c, SESSION_COOKIE_NAME, sessionId, { httpOnly: true, path: '/' })
       await saveSessionToStore(sessionId, session)
     }
   }
@@ -128,16 +152,17 @@ export function startUserSession(c: AppContext, userId: number): void {
 
 export async function destroySession(c: AppContext): Promise<void> {
   const sid = c.get('sessionId')
+  c.set('sessionDestroyed', true)
   if (sid) {
     await deleteSessionFromStore(sid)
   }
   setCookie(c, SESSION_COOKIE_NAME, '', { maxAge: 0, path: '/' })
 }
 
+// ストアのユーザーは共有オブジェクトなので、CSRF トークンはコピーに載せる
 export async function getSessionUser(c: AppContext): Promise<User | undefined> {
   const session = getSession(c)
   if (!session.userId) return undefined
-  const user = await findUserById(session.userId)
-  if (user) user.csrfToken = session.csrfToken
-  return user
+  const user = findUserById(session.userId)
+  return user ? { ...user, csrfToken: session.csrfToken } : undefined
 }

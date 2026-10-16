@@ -13,7 +13,6 @@ export interface User {
 export interface Post {
   id: number
   user_id: number
-  imgdata: Buffer
   body: string
   mime: string
   created_at: Date
@@ -41,6 +40,7 @@ export type AppEnv = {
   Variables: {
     session: SessionData
     sessionId: string
+    sessionDestroyed?: boolean
   }
 }
 

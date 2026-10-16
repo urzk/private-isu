@@ -33,11 +33,14 @@ export function imageUrl(post: Pick<Post, 'id' | 'mime'>): string {
   return `/image/${post.id}${ext ? `.${ext}` : ''}`
 }
 
+// テンプレートはコンパイル結果をキャッシュし、リクエストごとの読み込み・コンパイルを避ける
+const EJS_OPTIONS = { cache: true }
+
 // フラッシュメッセージは一度表示したら消す
 export async function render(c: AppContext, view: string, params: Record<string, unknown>): Promise<Response> {
   const session = getSession(c)
   const messages = { notice: session.flashNotice }
   session.flashNotice = undefined
-  const html = await ejs.renderFile(path.join(VIEWS_DIR, view), { ...params, messages, formatBody })
+  const html = await ejs.renderFile(path.join(VIEWS_DIR, view), { ...params, messages, formatBody }, EJS_OPTIONS)
   return c.html(html)
 }

@@ -1,6 +1,84 @@
 import { POSTS_PER_PAGE } from './config.js'
-import { execute, selectCount, selectOne, selectRows } from './db.js'
+import { execute, selectOne, selectRows } from './db.js'
 import type { Comment, Post, User } from './types.js'
+
+// アプリは単一プロセスで動くため、画像以外の読み取りはすべてメモリ上のストアから返す。
+// DB は書き込み(と画像本体)のためだけに使い、書き込み時にストアも同期して更新する。
+
+// ---- in-memory store ----
+
+const usersById = new Map<number, User>()
+const usersByAccountName = new Map<string, User>()
+
+// created_at DESC, id DESC (MySQL のインデックス逆順スキャンと同じ並び)
+let postsDesc: Post[] = []
+const postsById = new Map<number, Post>()
+const postsByUser = new Map<number, Post[]>()
+
+// 投稿ごとのコメント(古い順)。user は usersById と同じオブジェクトを参照する
+const commentsByPost = new Map<number, Comment[]>()
+const commentCountByUser = new Map<number, number>()
+
+function comparePostsDesc(a: Post, b: Post): number {
+  return b.created_at.getTime() - a.created_at.getTime() || b.id - a.id
+}
+
+// 降順配列に順序を保って挿入する(新規投稿はほぼ常に先頭)
+function insertPostSorted(list: Post[], post: Post): void {
+  let i = 0
+  while (i < list.length && comparePostsDesc(list[i], post) < 0) i++
+  list.splice(i, 0, post)
+}
+
+function addUser(user: User): void {
+  usersById.set(user.id, user)
+  usersByAccountName.set(user.account_name, user)
+}
+
+function addPost(post: Post): void {
+  postsById.set(post.id, post)
+  const list = postsByUser.get(post.user_id)
+  if (list) insertPostSorted(list, post)
+  else postsByUser.set(post.user_id, [post])
+}
+
+function addComment(comment: Comment): void {
+  const list = commentsByPost.get(comment.post_id)
+  if (list) list.push(comment)
+  else commentsByPost.set(comment.post_id, [comment])
+  commentCountByUser.set(comment.user_id, (commentCountByUser.get(comment.user_id) ?? 0) + 1)
+}
+
+async function loadStore(): Promise<void> {
+  const [users, posts, comments] = await Promise.all([selectRows<User>('SELECT * FROM `users`'), selectRows<Post>('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC, `id` DESC'), selectRows<Comment>('SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` ORDER BY `created_at`, `id`')])
+
+  usersById.clear()
+  usersByAccountName.clear()
+  postsById.clear()
+  postsByUser.clear()
+  commentsByPost.clear()
+  commentCountByUser.clear()
+
+  for (const user of users) addUser(user)
+
+  postsDesc = []
+  for (const post of posts) {
+    const user = usersById.get(post.user_id)
+    if (!user) continue
+    post.user = user
+    postsDesc.push(post)
+    addPost(post)
+  }
+
+  for (const comment of comments) {
+    const user = usersById.get(comment.user_id)
+    if (!user) continue
+    comment.user = user
+    addComment(comment)
+  }
+}
+
+export const storeReady: Promise<void> = loadStore()
 
 // ---- initialize ----
 
@@ -27,127 +105,186 @@ export async function dbInitialize(): Promise<void> {
   const sqls = ['DELETE FROM users WHERE id > 1000', 'DELETE FROM posts WHERE id > 10000', 'DELETE FROM comments WHERE id > 100000', 'UPDATE users SET del_flg = 0']
   await Promise.all(sqls.map((sql) => execute(sql)))
   await execute('UPDATE users SET del_flg = 1 WHERE id % 50 = 0')
+  clearImageCache()
+  await loadStore()
 }
 
 // ---- users ----
 
-export function findUserById(id: number): Promise<User | undefined> {
-  return selectOne<User>('SELECT * FROM `users` WHERE `id` = ?', [id])
+export function findUserById(id: number): User | undefined {
+  return usersById.get(id)
 }
 
-export function findActiveUserByAccountName(accountName: string): Promise<User | undefined> {
-  return selectOne<User>('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', [accountName])
+export function findActiveUserByAccountName(accountName: string): User | undefined {
+  const user = usersByAccountName.get(accountName)
+  return user && user.del_flg === 0 ? user : undefined
 }
 
-export async function accountNameExists(accountName: string): Promise<boolean> {
-  const row = await selectOne('SELECT 1 FROM users WHERE `account_name` = ?', [accountName])
-  return Boolean(row)
+export function accountNameExists(accountName: string): boolean {
+  return usersByAccountName.has(accountName)
 }
 
 export async function createUser(accountName: string, passhash: string): Promise<number> {
   const result = await execute('INSERT INTO `users` (`account_name`, `passhash`) VALUES (?, ?)', [accountName, passhash])
+  const row = await selectOne<User>('SELECT * FROM `users` WHERE `id` = ?', [result.insertId])
+  if (row) addUser(row)
   return result.insertId
 }
 
-export function findBannableUsers(): Promise<User[]> {
-  return selectRows<User>('SELECT * FROM `users` WHERE `authority` = 0 AND `del_flg` = 0 ORDER BY `created_at` DESC')
+export function findBannableUsers(): User[] {
+  const users: User[] = []
+  for (const user of usersById.values()) {
+    if (user.authority === 0 && user.del_flg === 0) users.push(user)
+  }
+  return users.sort((a, b) => b.created_at.getTime() - a.created_at.getTime())
 }
 
 export async function banUsers(ids: string[]): Promise<void> {
-  await Promise.all(ids.map((id) => execute('UPDATE `users` SET `del_flg` = ? WHERE `id` = ?', [1, id])))
-}
-
-async function getUsersByIds(userIds: number[]): Promise<Map<number, User>> {
-  const users = new Map<number, User>()
-  if (userIds.length === 0) return users
-  const rows = await selectRows<User>('SELECT * FROM `users` WHERE `id` IN (?)', [[...new Set(userIds)]])
-  for (const user of rows) users.set(user.id, user)
-  return users
+  if (ids.length === 0) return
+  await execute('UPDATE `users` SET `del_flg` = ? WHERE `id` IN (?)', [1, ids])
+  for (const id of ids) {
+    const user = usersById.get(Number(id))
+    if (user) user.del_flg = 1
+  }
 }
 
 // ---- posts ----
 
-const SELECT_ACTIVE_POSTS = 'SELECT `posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at` FROM `posts` JOIN `users` ON `posts`.`user_id` = `users`.`id` WHERE `users`.`del_flg` = 0'
-const LATEST_FIRST = ' ORDER BY `posts`.`created_at` DESC LIMIT ' + POSTS_PER_PAGE
-
-export function findLatestPosts(): Promise<Post[]> {
-  return selectRows<Post>(SELECT_ACTIVE_POSTS + LATEST_FIRST)
+function isActivePost(post: Post): boolean {
+  return post.user!.del_flg === 0
 }
 
-export function findLatestPostsByUser(userId: number): Promise<Post[]> {
-  return selectRows<Post>(SELECT_ACTIVE_POSTS + ' AND `posts`.`user_id` = ?' + LATEST_FIRST, [userId])
+function takeActivePosts(list: Post[], start = 0): Post[] {
+  const result: Post[] = []
+  for (let i = start; i < list.length && result.length < POSTS_PER_PAGE; i++) {
+    if (isActivePost(list[i])) result.push(list[i])
+  }
+  return result
 }
 
-export function findLatestPostsBefore(maxCreatedAt: Date | null): Promise<Post[]> {
-  return selectRows<Post>(SELECT_ACTIVE_POSTS + ' AND `posts`.`created_at` <= ?' + LATEST_FIRST, [maxCreatedAt])
+export function findLatestPosts(): Post[] {
+  return takeActivePosts(postsDesc)
 }
 
-export function findPostsById(id: string | undefined): Promise<Post[]> {
-  return selectRows<Post>(SELECT_ACTIVE_POSTS + ' AND `posts`.`id` = ?', [id])
+export function findLatestPostsByUser(userId: number): Post[] {
+  return takeActivePosts(postsByUser.get(userId) ?? [])
 }
 
-export function findPostImage(id: number): Promise<Pick<Post, 'mime' | 'imgdata'> | undefined> {
-  return selectOne<Pick<Post, 'mime' | 'imgdata'>>('SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = ?', [id])
+export function findLatestPostsBefore(maxCreatedAt: Date | null): Post[] {
+  if (!maxCreatedAt) return takeActivePosts(postsDesc)
+  // created_at <= max となる最初の位置を二分探索する
+  const max = maxCreatedAt.getTime()
+  let lo = 0
+  let hi = postsDesc.length
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1
+    if (postsDesc[mid].created_at.getTime() > max) lo = mid + 1
+    else hi = mid
+  }
+  return takeActivePosts(postsDesc, lo)
+}
+
+export function findPostById(id: string | undefined): Post | undefined {
+  if (!id || !/^[0-9]+$/.test(id)) return undefined
+  const post = postsById.get(Number(id))
+  return post && isActivePost(post) ? post : undefined
+}
+
+// 画像は投稿 ID ごとに不変なので、メタ情報だけで存在確認できる
+export function findPostMime(id: number): string | undefined {
+  return postsById.get(id)?.mime
+}
+
+export function findPostCreatedAt(id: number): Date | undefined {
+  return postsById.get(id)?.created_at
 }
 
 export async function createPost(userId: number, mime: string, imgdata: Buffer, body: string): Promise<number> {
   const result = await execute('INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)', [userId, mime, imgdata, body])
-  return result.insertId
+  const id = result.insertId
+  const row = await selectOne<{ created_at: Date }>('SELECT `created_at` FROM `posts` WHERE `id` = ?', [id])
+  const user = usersById.get(userId)
+  if (row && user) {
+    const post: Post = { id, user_id: userId, body, mime, created_at: row.created_at, user }
+    insertPostSorted(postsDesc, post)
+    addPost(post)
+  }
+  cacheImage(id, imgdata)
+  return id
 }
 
-export function countPostsByUser(userId: number): Promise<number> {
-  return selectCount('SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?', [userId])
+export function countPostsByUser(userId: number): number {
+  return postsByUser.get(userId)?.length ?? 0
+}
+
+// ---- images ----
+
+// 画像本体だけは DB に残し、最近使ったものをバイト数上限付きでメモリに持つ
+const IMAGE_CACHE_LIMIT = 128 * 1024 * 1024
+const imageCache = new Map<number, Buffer>()
+let imageCacheBytes = 0
+
+function cacheImage(id: number, imgdata: Buffer): void {
+  if (imgdata.length > IMAGE_CACHE_LIMIT) return
+  const old = imageCache.get(id)
+  if (old) {
+    imageCache.delete(id)
+    imageCacheBytes -= old.length
+  }
+  imageCache.set(id, imgdata)
+  imageCacheBytes += imgdata.length
+  for (const [oldestId, oldest] of imageCache) {
+    if (imageCacheBytes <= IMAGE_CACHE_LIMIT) break
+    imageCache.delete(oldestId)
+    imageCacheBytes -= oldest.length
+  }
+}
+
+function clearImageCache(): void {
+  imageCache.clear()
+  imageCacheBytes = 0
+}
+
+export async function findPostImage(id: number): Promise<Buffer | undefined> {
+  const cached = imageCache.get(id)
+  if (cached) {
+    // LRU: 末尾に移動
+    imageCache.delete(id)
+    imageCache.set(id, cached)
+    return cached
+  }
+  const row = await selectOne<{ imgdata: Buffer }>('SELECT `imgdata` FROM `posts` WHERE `id` = ?', [id])
+  if (!row) return undefined
+  cacheImage(id, row.imgdata)
+  return row.imgdata
 }
 
 // ---- comments ----
 
 export async function createComment(postId: number, userId: number, comment: string): Promise<void> {
-  await execute('INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)', [postId, userId, comment])
+  const result = await execute('INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)', [postId, userId, comment])
+  const user = usersById.get(userId)
+  if (user) addComment({ id: result.insertId, post_id: postId, user_id: userId, comment, created_at: new Date(), user })
 }
 
-export function countCommentsByUser(userId: number): Promise<number> {
-  return selectCount('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', [userId])
+export function countCommentsByUser(userId: number): number {
+  return commentCountByUser.get(userId) ?? 0
 }
 
-export function countCommentsOnUserPosts(userId: number): Promise<number> {
-  return selectCount('SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (SELECT `id` FROM `posts` WHERE `user_id` = ?)', [userId])
+export function countCommentsOnUserPosts(userId: number): number {
+  let count = 0
+  for (const post of postsByUser.get(userId) ?? []) count += commentsByPost.get(post.id)?.length ?? 0
+  return count
 }
 
-async function getCommentCounts(postIds: number[]): Promise<Map<number, number>> {
-  const rows = await selectRows<{ post_id: number; count: number }>('SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (?) GROUP BY `post_id`', [postIds])
-  return new Map(rows.map((row) => [row.post_id, row.count]))
-}
-
-// 投稿ごとに新しい順で番号を振り、古い順(rn の降順)で並べ直す
-function getComments(postIds: number[], allComments: boolean): Promise<Comment[]> {
-  const latestOnly = allComments ? '' : ' WHERE `rn` <= 3'
-  const sql = 'SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM (SELECT `comments`.*, ROW_NUMBER() OVER (PARTITION BY `post_id` ORDER BY `created_at` DESC) AS `rn` FROM `comments` WHERE `post_id` IN (?)) AS `c`' + latestOnly + ' ORDER BY `post_id`, `rn` DESC'
-  return selectRows<Comment>(sql, [postIds])
-}
-
-// 投稿にコメント数・コメント(投稿者付き)・投稿者を埋め込む
-export async function makePosts(posts: Post[], options: { allComments?: boolean } = {}): Promise<Post[]> {
-  if (posts.length === 0) return posts
-  const postIds = posts.map((post) => post.id)
-
-  const commentCounts = await getCommentCounts(postIds)
-  const comments = await getComments(postIds, Boolean(options.allComments))
-  const users = await getUsersByIds([...posts.map((post) => post.user_id), ...comments.map((comment) => comment.user_id)])
-
-  const commentsByPost = new Map<number, Comment[]>()
-  for (const comment of comments) {
-    const user = users.get(comment.user_id)
-    if (!user) continue
-    comment.user = user
-    const list = commentsByPost.get(comment.post_id)
-    if (list) list.push(comment)
-    else commentsByPost.set(comment.post_id, [comment])
-  }
-
-  for (const post of posts) {
-    post.comment_count = commentCounts.get(post.id) || 0
-    post.comments = commentsByPost.get(post.id) ?? []
-    post.user = users.get(post.user_id)
-  }
-  return posts
+// 投稿にコメント数・コメント(投稿者付き)を埋め込んだ表示用オブジェクトを作る(ストアは変更しない)
+export function makePosts(posts: Post[], options: { allComments?: boolean } = {}): Post[] {
+  return posts.map((post) => {
+    const comments = commentsByPost.get(post.id) ?? []
+    return {
+      ...post,
+      comment_count: comments.length,
+      comments: options.allComments ? comments : comments.slice(-3)
+    }
+  })
 }
