@@ -6,7 +6,6 @@ import ejs from 'ejs'
 import Memcached from 'memcached'
 import { createPool, Pool, RowDataPacket, ResultSetHeader } from 'mysql2/promise'
 import crypto from 'crypto'
-import { spawnSync } from 'child_process'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
@@ -29,7 +28,6 @@ const UPLOAD_LIMIT = 10 * 1024 * 1024
 
 const POST_COLUMNS = '`posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at`'
 const JOIN_ACTIVE_USERS = ' FROM `posts` JOIN `users` ON `posts`.`user_id` = `users`.`id` WHERE `users`.`del_flg` = 0'
-const JOIN_USERS_TO_COMMENTS = ' FROM `comments` JOIN `users` ON `comments`.`user_id` = `users`.`id`'
 
 const db: Pool = createPool({
   host: process.env.ISUCONP_DB_HOST || 'localhost',
@@ -37,7 +35,7 @@ const db: Pool = createPool({
   user: process.env.ISUCONP_DB_USER || 'root',
   password: process.env.ISUCONP_DB_PASSWORD,
   database: process.env.ISUCONP_DB_NAME || 'isuconp',
-  connectionLimit: 1,
+  connectionLimit: 10,
   charset: 'utf8mb4'
 })
 
@@ -74,10 +72,6 @@ interface Comment {
 
 interface CountRow {
   count: number
-}
-
-interface IdRow {
-  id: number
 }
 
 interface SessionData {
@@ -204,22 +198,8 @@ app.use('*', async (c: AppContext, next: Next): Promise<void> => {
   }
 })
 
-function shellEscape(arg: string): string {
-  if (arg === '') return "''"
-  return `'${arg.replace(/'/g, `'\\''`)}'`
-}
-
 function digest(src: string): string {
-  const command = `printf "%s" ${shellEscape(src)} | openssl dgst -sha512 | sed 's/^.*= //'`
-  const result = spawnSync('/bin/sh', ['-c', command], {
-    encoding: 'utf8'
-  })
-  if (result.error) throw result.error
-  if (result.status !== 0) {
-    const message = (result.stderr || '').toString().trim()
-    throw new Error(`openssl failed: ${message}`)
-  }
-  return result.stdout.replace(/^.*= /, '').trim()
+  return crypto.createHash('sha512').update(src, 'utf8').digest('hex')
 }
 
 function validateUser(accountName: string, password: string): boolean {
@@ -256,12 +236,34 @@ async function tryLogin(accountName: string, password: string): Promise<User | u
   return undefined
 }
 
-async function getUser(userId: number) {
-  const [rows] = await db.query<RowDataPacket[]>('SELECT * FROM `users` WHERE `id` = ?', [userId])
-  return rows[0] as User
+async function getUsersByIds(userIds: number[]): Promise<Map<number, User>> {
+  const users = new Map<number, User>()
+  if (userIds.length === 0) return users
+  const [rows] = await db.query<RowDataPacket[]>('SELECT * FROM `users` WHERE `id` IN (?)', [[...new Set(userIds)]])
+  for (const user of rows as User[]) users.set(user.id, user)
+  return users
+}
+
+// ダンプには主キーしかないため、/initialize のたびに不足しているインデックスだけを作る
+const INDEXES: { table: string; name: string; columns: string }[] = [
+  { table: 'posts', name: 'idx_posts_created_at', columns: '`created_at`' },
+  { table: 'posts', name: 'idx_posts_user_id_created_at', columns: '`user_id`, `created_at`' },
+  { table: 'comments', name: 'idx_comments_post_id_created_at', columns: '`post_id`, `created_at`' },
+  { table: 'comments', name: 'idx_comments_user_id', columns: '`user_id`' },
+  { table: 'users', name: 'idx_users_authority_del_flg_created_at', columns: '`authority`, `del_flg`, `created_at`' }
+]
+
+async function ensureIndexes(): Promise<void> {
+  const [rows] = await db.query<RowDataPacket[]>('SELECT `TABLE_NAME` AS `table_name`, `INDEX_NAME` AS `index_name` FROM `information_schema`.`STATISTICS` WHERE `TABLE_SCHEMA` = DATABASE()')
+  const existing = new Set(rows.map((row) => `${row.table_name}.${row.index_name}`))
+  for (const index of INDEXES) {
+    if (existing.has(`${index.table}.${index.name}`)) continue
+    await db.query<ResultSetHeader>(`ALTER TABLE \`${index.table}\` ADD INDEX \`${index.name}\` (${index.columns})`)
+  }
 }
 
 async function dbInitialize(): Promise<void> {
+  await ensureIndexes()
   const sqls = ['DELETE FROM users WHERE id > 1000', 'DELETE FROM posts WHERE id > 10000', 'DELETE FROM comments WHERE id > 100000', 'UPDATE users SET del_flg = 0']
   await Promise.all(sqls.map((sql) => db.query<ResultSetHeader>(sql)))
   await db.query<ResultSetHeader>('UPDATE users SET del_flg = 1 WHERE id % 50 = 0')
@@ -283,23 +285,41 @@ function imageUrl(post: Pick<Post, 'id' | 'mime'>): string {
   return `/image/${post.id}${ext}`
 }
 
-async function makePost(post: Post, options: CommentOptions = {}): Promise<Post> {
-  const [[countRow]] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', [post.id])
-  post.comment_count = (countRow as CountRow | undefined)?.count || 0
-  let query = 'SELECT *' + JOIN_USERS_TO_COMMENTS + ' WHERE `comments`.`post_id` = ? ORDER BY `comments`.`created_at` DESC'
-  if (!options.allComments) {
-    query += ' LIMIT 3'
-  }
-  const [commentRows] = await db.query<RowDataPacket[]>({ sql: query, nestTables: true }, [post.id])
-  const comments = commentRows.map((row) => ({ ...(row.comments as Comment), user: row.users as User }))
-  post.comments = comments.reverse()
-  post.user = await getUser(post.user_id)
-  return post
-}
+async function makePosts(posts: Post[], options: CommentOptions = {}): Promise<Post[]> {
+  if (posts.length === 0) return posts
+  const postIds = posts.map((post) => post.id)
 
-async function makePosts(posts: Post[], options: { allComments?: boolean } = {}): Promise<Post[]> {
-  const built: Post[] = await Promise.all(posts.map((post) => makePost(post, options)))
-  return built
+  const [countRows] = await db.query<RowDataPacket[]>('SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (?) GROUP BY `post_id`', [postIds])
+  const commentCounts = new Map<number, number>()
+  for (const row of countRows) commentCounts.set(row.post_id as number, row.count as number)
+
+  // 投稿ごとに新しい順で番号を振り、古い順(rn の降順)で並べ直す
+  let commentQuery = 'SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM (SELECT `comments`.*, ROW_NUMBER() OVER (PARTITION BY `post_id` ORDER BY `created_at` DESC) AS `rn` FROM `comments` WHERE `post_id` IN (?)) AS `c`'
+  if (!options.allComments) {
+    commentQuery += ' WHERE `rn` <= 3'
+  }
+  commentQuery += ' ORDER BY `post_id`, `rn` DESC'
+  const [commentRows] = await db.query<RowDataPacket[]>(commentQuery, [postIds])
+  const comments = commentRows as Comment[]
+
+  const users = await getUsersByIds([...posts.map((post) => post.user_id), ...comments.map((comment) => comment.user_id)])
+
+  const commentsByPost = new Map<number, Comment[]>()
+  for (const comment of comments) {
+    const user = users.get(comment.user_id)
+    if (!user) continue
+    comment.user = user
+    const list = commentsByPost.get(comment.post_id)
+    if (list) list.push(comment)
+    else commentsByPost.set(comment.post_id, [comment])
+  }
+
+  for (const post of posts) {
+    post.comment_count = commentCounts.get(post.id) || 0
+    post.comments = commentsByPost.get(post.id) ?? []
+    post.user = users.get(post.user_id)
+  }
+  return posts
 }
 
 async function render(c: AppContext, view: string, params: RenderParams): Promise<Response> {
@@ -409,10 +429,8 @@ app.post('/register', async (c: AppContext) => {
     return c.redirect('/register')
   }
   const passhash = calculatePasshash(accountName, password)
-  await db.query('INSERT INTO `users` (`account_name`, `passhash`) VALUES (?, ?)', [accountName, passhash])
-  const [meRow] = await db.query<RowDataPacket[]>('SELECT * FROM `users` WHERE `account_name` = ?', [accountName])
-  const newUser = meRow[0] as User
-  session.userId = newUser.id
+  const [result] = await db.query<ResultSetHeader>('INSERT INTO `users` (`account_name`, `passhash`) VALUES (?, ?)', [accountName, passhash])
+  session.userId = result.insertId
   session.csrfToken = crypto.randomBytes(16).toString('hex')
   return c.redirect('/')
 })
@@ -445,14 +463,10 @@ app.get('/:accountName{@[A-Za-z0-9_]+}', async (c: AppContext) => {
     const posts = await makePosts(postRowData as Post[])
     const [commentCountRows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', [user.id])
     const commentCount = (commentCountRows[0] as CountRow | undefined)?.count ?? 0
-    const [postIdRows] = await db.query<RowDataPacket[]>('SELECT `id` FROM `posts` WHERE `user_id` = ?', [user.id])
-    const postIds = (postIdRows as IdRow[]).map((r) => r.id)
-    const postCount = postIds.length
-    let commentedCount = 0
-    if (postCount > 0) {
-      const [countRows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (?)', [postIds])
-      commentedCount = (countRows[0] as CountRow | undefined)?.count ?? 0
-    }
+    const [postCountRows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `posts` WHERE `user_id` = ?', [user.id])
+    const postCount = (postCountRows[0] as CountRow | undefined)?.count ?? 0
+    const [commentedCountRows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `comments` WHERE `post_id` IN (SELECT `id` FROM `posts` WHERE `user_id` = ?)', [user.id])
+    const commentedCount = (commentedCountRows[0] as CountRow | undefined)?.count ?? 0
     const me = await getSessionUser(c)
     return render(c, 'user.ejs', { me, user, posts, post_count: postCount, comment_count: commentCount, commented_count: commentedCount, imageUrl })
   } catch (e) {
@@ -480,7 +494,7 @@ app.get('/posts', async (c: AppContext) => {
 
 app.get('/posts/:id', async (c: AppContext) => {
   const id = c.req.param('id')
-  const [postRows] = await db.query<RowDataPacket[]>('SELECT `posts`.*' + JOIN_ACTIVE_USERS + ' AND `posts`.`id` = ?', [id])
+  const [postRows] = await db.query<RowDataPacket[]>('SELECT ' + POST_COLUMNS + JOIN_ACTIVE_USERS + ' AND `posts`.`id` = ?', [id])
   const posts = postRows as Post[]
   const enriched = await makePosts(posts, { allComments: true })
   const post = enriched[0]
@@ -522,7 +536,7 @@ app.get('/image/:filename{[0-9]+\\.(png|jpg|gif)}', async (c: AppContext) => {
     if (id === 0) {
       return new Response('', { status: 200 })
     }
-    const [posts] = await db.query<RowDataPacket[]>('SELECT * FROM `posts` WHERE `id` = ?', [id])
+    const [posts] = await db.query<RowDataPacket[]>('SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = ?', [id])
     const post = (posts as Post[])[0]
     if (!post) return c.text('image not found', 404)
     if ((ext === 'jpg' && post.mime === 'image/jpeg') || (ext === 'png' && post.mime === 'image/png') || (ext === 'gif' && post.mime === 'image/gif')) {
