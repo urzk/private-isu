@@ -4,22 +4,22 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "dev": "ts-node-dev --respawn src/app.ts",
+    "dev": "tsx watch src/app.ts",
     "start": "node dist/app.js"
   },
   "dependencies": {
-    "memcached": "^2.2.2",
+    "@hono/node-server": "^2.1.1",
     "ejs": "^6.0.1",
-    "multer": "^2.3.0",
-    "mysql2": "^3.24.4",
     "hono": "^4.13.9",
-    "@hono/node-server": "^2.1.1"
+    "memcached": "^2.2.2",
+    "multer": "^2.3.0",
+    "mysql2": "^3.24.4"
   },
   "devDependencies": {
     "@types/ejs": "^3.1.5",
     "@types/memcached": "^2.2.10",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^7.0.2",
-    "@types/node": "^24.13.3"
+    "@types/node": "^24.13.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   }
 }
