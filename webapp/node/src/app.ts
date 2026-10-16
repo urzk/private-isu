@@ -27,6 +27,10 @@ type ParsedBody = Record<string, ParsedBodyValue>
 const POSTS_PER_PAGE = 20
 const UPLOAD_LIMIT = 10 * 1024 * 1024
 
+const POST_COLUMNS = '`posts`.`id`, `posts`.`user_id`, `posts`.`body`, `posts`.`mime`, `posts`.`created_at`'
+const JOIN_ACTIVE_USERS = ' FROM `posts` JOIN `users` ON `posts`.`user_id` = `users`.`id` WHERE `users`.`del_flg` = 0'
+const JOIN_USERS_TO_COMMENTS = ' FROM `comments` JOIN `users` ON `comments`.`user_id` = `users`.`id`'
+
 const db: Pool = createPool({
   host: process.env.ISUCONP_DB_HOST || 'localhost',
   port: Number(process.env.ISUCONP_DB_PORT) || 3306,
@@ -258,12 +262,7 @@ async function getUser(userId: number) {
 }
 
 async function dbInitialize(): Promise<void> {
-  const sqls = [
-    'DELETE FROM users WHERE id > 1000',
-    'DELETE FROM posts WHERE id > 10000',
-    'DELETE FROM comments WHERE id > 100000',
-    'UPDATE users SET del_flg = 0'
-  ]
+  const sqls = ['DELETE FROM users WHERE id > 1000', 'DELETE FROM posts WHERE id > 10000', 'DELETE FROM comments WHERE id > 100000', 'UPDATE users SET del_flg = 0']
   await Promise.all(sqls.map((sql) => db.query<ResultSetHeader>(sql)))
   await db.query<ResultSetHeader>('UPDATE users SET del_flg = 1 WHERE id % 50 = 0')
 }
@@ -284,36 +283,22 @@ function imageUrl(post: Pick<Post, 'id' | 'mime'>): string {
   return `/image/${post.id}${ext}`
 }
 
-async function makeComment(comment: Comment): Promise<Comment> {
-  comment.user = await getUser(comment.user_id)
-  return comment
-}
-
 async function makePost(post: Post, options: CommentOptions = {}): Promise<Post> {
   const [[countRow]] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', [post.id])
   post.comment_count = (countRow as CountRow | undefined)?.count || 0
-  let query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC'
+  let query = 'SELECT *' + JOIN_USERS_TO_COMMENTS + ' WHERE `comments`.`post_id` = ? ORDER BY `comments`.`created_at` DESC'
   if (!options.allComments) {
     query += ' LIMIT 3'
   }
-  const [commentRows] = await db.query<RowDataPacket[]>(query, [post.id])
-  const comments = await Promise.all((commentRows as Comment[]).map(makeComment))
+  const [commentRows] = await db.query<RowDataPacket[]>({ sql: query, nestTables: true }, [post.id])
+  const comments = commentRows.map((row) => ({ ...(row.comments as Comment), user: row.users as User }))
   post.comments = comments.reverse()
   post.user = await getUser(post.user_id)
   return post
 }
 
 async function makePosts(posts: Post[], options: { allComments?: boolean } = {}): Promise<Post[]> {
-  const built: Post[] = []
-  for (const post of posts) {
-    const enriched = await makePost(post, options)
-    if (enriched.user && enriched.user.del_flg === 0) {
-      built.push(enriched)
-    }
-    if (built.length >= POSTS_PER_PAGE) {
-      break
-    }
-  }
+  const built: Post[] = await Promise.all(posts.map((post) => makePost(post, options)))
   return built
 }
 
@@ -440,7 +425,7 @@ app.get('/logout', async (c: AppContext) => {
 app.get('/', async (c: AppContext) => {
   try {
     const me = await getSessionUser(c)
-    const [postRows] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `created_at`, `mime` FROM `posts` ORDER BY `created_at` DESC')
+    const [postRows] = await db.query<RowDataPacket[]>('SELECT ' + POST_COLUMNS + JOIN_ACTIVE_USERS + ' ORDER BY `posts`.`created_at` DESC LIMIT ' + POSTS_PER_PAGE)
     const posts = postRows as Post[]
     const enriched = await makePosts(posts)
     return render(c, 'index.ejs', { posts: enriched, me, imageUrl })
@@ -456,7 +441,7 @@ app.get('/:accountName{@[A-Za-z0-9_]+}', async (c: AppContext) => {
     const [urows] = await db.query<RowDataPacket[]>('SELECT * FROM `users` WHERE `account_name` = ? AND `del_flg` = 0', [accountName])
     const user = urows[0] as User
     if (!user) return c.text('not_found', 404)
-    const [postRowData] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC', [user.id])
+    const [postRowData] = await db.query<RowDataPacket[]>('SELECT ' + POST_COLUMNS + JOIN_ACTIVE_USERS + ' AND `posts`.`user_id` = ? ORDER BY `posts`.`created_at` DESC LIMIT ' + POSTS_PER_PAGE, [user.id])
     const posts = await makePosts(postRowData as Post[])
     const [commentCountRows] = await db.query<RowDataPacket[]>('SELECT COUNT(*) AS count FROM `comments` WHERE `user_id` = ?', [user.id])
     const commentCount = (commentCountRows[0] as CountRow | undefined)?.count ?? 0
@@ -486,7 +471,7 @@ app.get('/posts', async (c: AppContext) => {
     }
     maxCreatedAt = parsed
   }
-  const [postRows] = await db.query<RowDataPacket[]>('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC', [maxCreatedAt])
+  const [postRows] = await db.query<RowDataPacket[]>('SELECT ' + POST_COLUMNS + JOIN_ACTIVE_USERS + ' AND `posts`.`created_at` <= ? ORDER BY `posts`.`created_at` DESC LIMIT ' + POSTS_PER_PAGE, [maxCreatedAt])
   const posts = postRows as Post[]
   const me = await getSessionUser(c)
   const enriched = await makePosts(posts)
@@ -495,7 +480,7 @@ app.get('/posts', async (c: AppContext) => {
 
 app.get('/posts/:id', async (c: AppContext) => {
   const id = c.req.param('id')
-  const [postRows] = await db.query<RowDataPacket[]>('SELECT * FROM `posts` WHERE `id` = ?', [id])
+  const [postRows] = await db.query<RowDataPacket[]>('SELECT `posts`.*' + JOIN_ACTIVE_USERS + ' AND `posts`.`id` = ?', [id])
   const posts = postRows as Post[]
   const enriched = await makePosts(posts, { allComments: true })
   const post = enriched[0]
@@ -586,9 +571,6 @@ app.post('/admin/banned', async (c: AppContext) => {
 
 app.use('/*', serveStatic({ root: '../public' }))
 
-serve(
-  { fetch: app.fetch, port: 8080 },
-  (info: { port: number }) => {
-    console.log(`server started on ${info.port}`)
-  }
-)
+serve({ fetch: app.fetch, port: 8080 }, (info: { port: number }) => {
+  console.log(`server started on ${info.port}`)
+})
